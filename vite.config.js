@@ -7,8 +7,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // https://vite.dev/config/
 export default defineConfig({
-  base: '/Vehical-Rental-Management/',
   plugins: [react()],
+  base: '/Vehical-Rental-Management/',
   resolve: {
     preserveSymlinks: true,
     dedupe: ['react', 'react-dom', 'react-router-dom'],

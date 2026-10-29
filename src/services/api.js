@@ -1,43 +1,172 @@
-export const API_URL = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) || "http://localhost:3000";
+
+
+const configuredApiUrl = import.meta.env.VITE_API_URL?.trim().replace(/\/+$/, '');
+
+const isProduction = import.meta.env.PROD;
+
+const API_URL =
+  configuredApiUrl || (isProduction ? '' : 'http://localhost:3000');
+
 
 let activeApiUrl = API_URL;
 
-// Generate prioritized candidate URLs for connection resilience
+// Build API candidates without sending production API requests
+// to the GitHub Pages frontend.
 export const getCandidateUrls = () => {
-  const urls = [activeApiUrl];
-  if (activeApiUrl.includes('localhost')) {
-    urls.push(activeApiUrl.replace('localhost', '127.0.0.1'));
-  } else if (activeApiUrl.includes('127.0.0.1')) {
-    urls.push(activeApiUrl.replace('127.0.0.1', 'localhost'));
+  if (configuredApiUrl) {
+    return [configuredApiUrl];
   }
-  // Also try relative URL (which leverages Vite dev proxy) if running in browser
-  if (typeof window !== 'undefined' && !urls.includes('')) {
-    urls.push('');
+
+  if (isProduction) {
+    return [];
   }
+
+  const urls = [activeApiUrl || 'http://localhost:3000'];
+
+  if (urls[0].includes('localhost')) {
+    urls.push(urls[0].replace('localhost', '127.0.0.1'));
+  } else if (urls[0].includes('127.0.0.1')) {
+    urls.push(urls[0].replace('127.0.0.1', 'localhost'));
+  }
+
   return [...new Set(urls)];
 };
 
-// Helper function to check if JSON Server is running and reachable
+const createConfigurationError = () =>
+  new Error(
+    'Production API is not configured. Set VITE_API_URL to your publicly hosted JSON Server API URL, then rebuild and redeploy the frontend.'
+  );
+
+const createHttpError = async (response, url) => {
+  const contentType = response.headers.get('content-type') || '';
+
+  let details = '';
+
+  if (contentType.includes('application/json')) {
+    try {
+      details = JSON.stringify(await response.json());
+    } catch {
+      details = response.statusText;
+    }
+  } else {
+    // Avoid displaying a large HTML error page in the UI.
+    details = response.statusText || 'The server returned a non-JSON response.';
+  }
+
+  return new Error(
+    `API request failed: HTTP ${response.status} for ${url}. ${details}`
+  );
+};
+
+const request = async (endpoint, options = {}) => {
+  const candidateUrls = getCandidateUrls();
+
+  if (candidateUrls.length === 0) {
+    throw createConfigurationError();
+  }
+
+  let lastError;
+
+  for (const baseUrl of candidateUrls) {
+    const url = `${baseUrl}${endpoint}`;
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          Accept: 'application/json',
+          ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+          ...options.headers,
+        },
+      });
+
+      if (!response.ok) {
+        throw await createHttpError(response, url);
+      }
+
+      // DELETE requests commonly return 204 No Content.
+      if (response.status === 204) {
+        activeApiUrl = baseUrl;
+        return null;
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+
+      if (!contentType.includes('application/json')) {
+        throw new Error(
+          `Expected JSON from ${url}, but received ${contentType || 'an unknown content type'}. Check your API URL.`
+        );
+      }
+
+      activeApiUrl = baseUrl;
+      return await response.json();
+    } catch (error) {
+      lastError = error;
+
+      // Retry the alternate localhost address only for network failures.
+      if (!(error instanceof TypeError)) {
+        throw error;
+      }
+    }
+  }
+
+  console.error(`API error on ${options.method || 'GET'} ${endpoint}:`, lastError);
+
+  throw new Error(
+    `Cannot connect to the API. ${lastError?.message || 'Check the API server and network connection.'}`
+  );
+};
+
+// Check whether the configured JSON Server API is available.
 export const checkServerHealth = async () => {
   const candidateUrls = getCandidateUrls();
 
-  for (const url of candidateUrls) {
+  if (candidateUrls.length === 0) {
+    return {
+      ok: false,
+      status: 0,
+      url: '',
+      error:
+        'Production API is not configured. Set VITE_API_URL to your hosted JSON Server API URL.',
+    };
+  }
+
+  let lastError;
+
+  for (const baseUrl of candidateUrls) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2000);
-      const testUrl = url ? `${url}/vehicles` : '/vehicles';
-      const response = await fetch(testUrl, {
+      const response = await fetch(`${baseUrl}/vehicles`, {
         method: 'GET',
         headers: { Accept: 'application/json' },
         signal: controller.signal,
       });
-      clearTimeout(timeoutId);
-      if (response.ok) {
-        activeApiUrl = url;
-        return { ok: true, status: response.status, url };
+
+      if (!response.ok) {
+        lastError = new Error(`HTTP ${response.status} from ${baseUrl}`);
+        continue;
       }
-    } catch {
-      // Try next candidate
+
+      const contentType = response.headers.get('content-type') || '';
+
+      if (!contentType.includes('application/json')) {
+        lastError = new Error(`The API at ${baseUrl} did not return JSON.`);
+        continue;
+      }
+
+      activeApiUrl = baseUrl;
+
+      return {
+        ok: true,
+        status: response.status,
+        url: baseUrl,
+      };
+    } catch (error) {
+      lastError = error;
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -45,157 +174,93 @@ export const checkServerHealth = async () => {
     ok: false,
     status: 0,
     url: activeApiUrl,
-    error: `JSON Server is not reachable at ${activeApiUrl || 'port 3000'}. Please start it with 'npm run server'.`,
+    error:
+      lastError?.message ||
+      `The API is not reachable at ${activeApiUrl || 'the configured URL'}.`,
   };
-};
-
-// Helper function to handle fetch responses and errors with multi-target fallback
-const request = async (endpoint, options = {}) => {
-  const candidateUrls = getCandidateUrls();
-  let lastError = null;
-
-  for (const baseUrl of candidateUrls) {
-    const url = `${baseUrl}${endpoint}`;
-    const config = {
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-      ...options,
-    };
-
-    try {
-      const response = await fetch(url, config);
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP ${response.status}: ${errorText || response.statusText}`);
-      }
-      activeApiUrl = baseUrl;
-      const contentType = response.headers.get('content-type');
-      if (contentType && contentType.includes('application/json')) {
-        return await response.json();
-      }
-      return null;
-    } catch (error) {
-      lastError = error;
-      // If it is a server response error (not a network refusal), don't try other hosts
-      const isNetworkError =
-        error instanceof TypeError &&
-        (error.message.includes('fetch') ||
-          error.message.includes('NetworkError') ||
-          error.message.includes('Failed') ||
-          error.message.includes('aborted'));
-      if (!isNetworkError) {
-        throw error;
-      }
-      // Continue loop to try next candidate
-    }
-  }
-
-  console.error(`API Error on [${options.method || 'GET'}] ${endpoint}:`, lastError);
-
-  const enhancedError = new Error(
-    `Cannot connect to JSON Server at ${activeApiUrl || 'http://localhost:3000'}. Ensure the server is running on port 3000 ('npm run server') and there are no port conflicts.`
-  );
-  enhancedError.cause = lastError;
-  throw enhancedError;
 };
 
 // ==========================================
 // Vehicle API Services
 // ==========================================
-export const getVehicles = async () => {
-  return await request('/vehicles');
-};
+export const getVehicles = () => request('/vehicles');
 
-export const getVehicleById = async (id) => {
-  return await request(`/vehicles/${id}`);
-};
+export const getVehicleById = (id) =>
+  request(`/vehicles/${encodeURIComponent(id)}`);
 
-export const addVehicle = async (vehicle) => {
-  return await request('/vehicles', {
+export const addVehicle = (vehicle) =>
+  request('/vehicles', {
     method: 'POST',
     body: JSON.stringify(vehicle),
   });
-};
 
-export const updateVehicle = async (id, vehicle) => {
-  return await request(`/vehicles/${id}`, {
+export const updateVehicle = (id, vehicle) =>
+  request(`/vehicles/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(vehicle),
   });
-};
 
-export const deleteVehicle = async (id) => {
-  return await request(`/vehicles/${id}`, {
+export const deleteVehicle = (id) =>
+  request(`/vehicles/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
-};
 
 // ==========================================
 // Customer API Services
 // ==========================================
-export const getCustomers = async () => {
-  return await request('/customers');
-};
+export const getCustomers = () => request('/customers');
 
-export const getCustomerById = async (id) => {
-  return await request(`/customers/${id}`);
-};
+export const getCustomerById = (id) =>
+  request(`/customers/${encodeURIComponent(id)}`);
 
-export const addCustomer = async (customer) => {
-  return await request('/customers', {
+export const addCustomer = (customer) =>
+  request('/customers', {
     method: 'POST',
     body: JSON.stringify(customer),
   });
-};
 
-export const updateCustomer = async (id, customer) => {
-  return await request(`/customers/${id}`, {
+export const updateCustomer = (id, customer) =>
+  request(`/customers/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(customer),
   });
-};
 
-export const deleteCustomer = async (id) => {
-  return await request(`/customers/${id}`, {
+export const deleteCustomer = (id) =>
+  request(`/customers/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
-};
 
 // ==========================================
 // Rental API Services
 // ==========================================
-export const getRentals = async () => {
-  return await request('/rentals');
-};
+export const getRentals = () => request('/rentals');
 
-export const getRentalById = async (id) => {
-  return await request(`/rentals/${id}`);
-};
+export const getRentalById = (id) =>
+  request(`/rentals/${encodeURIComponent(id)}`);
 
-export const addRental = async (rental) => {
-  return await request('/rentals', {
+export const addRental = (rental) =>
+  request('/rentals', {
     method: 'POST',
     body: JSON.stringify(rental),
   });
-};
 
-export const updateRental = async (id, rental) => {
-  return await request(`/rentals/${id}`, {
+export const updateRental = (id, rental) =>
+  request(`/rentals/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(rental),
   });
-};
 
-export const deleteRental = async (id) => {
-  return await request(`/rentals/${id}`, {
+export const deleteRental = (id) =>
+  request(`/rentals/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
-};
 
+// ==========================================
+// Default export
+// ==========================================
 export default {
   API_URL,
+  getCandidateUrls,
   checkServerHealth,
   getVehicles,
   getVehicleById,
